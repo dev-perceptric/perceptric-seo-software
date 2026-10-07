@@ -1,12 +1,16 @@
 """
 Perceptric SEO Research v2. An in-house Semrush-style research tool.
-Data: DataForSEO API (pay per request). Optional AI summaries: Claude API.
+Data: DataForSEO API (pay per request). AI visibility: ChatGPT, Claude, Gemini and Perplexity APIs.
 Run locally:  streamlit run app.py
 """
 import html
 import json
 import os
-from collections import Counter
+import re
+import time
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from urllib.parse import urlparse
 
 import altair as alt
@@ -468,6 +472,333 @@ def ai_summary(context, df):
         st.markdown(msg.content[0].text)
 
 
+# ───────────────────────── AI visibility helpers ─────────────────────────
+AI_ENGINES = {  # engine: (API key name, model setting name, default model)
+    "ChatGPT": ("OPENAI_API_KEY", "OPENAI_MODEL", "gpt-5.2"),
+    "Claude": ("ANTHROPIC_API_KEY", "CLAUDE_MODEL", "claude-sonnet-5-5"),
+    "Gemini": ("GEMINI_API_KEY", "GEMINI_MODEL", "gemini-3-flash-preview"),
+    "Perplexity": ("PERPLEXITY_API_KEY", "PERPLEXITY_MODEL", "sonar"),
+}
+AI_WEB = str(secret("USE_WEB_SEARCH", "true")).lower() == "true"
+AI_WORKERS = int(secret("MAX_WORKERS", 8))
+
+KEYWORD_PROMPT = """You are a B2B SEO strategist. Analyze this company website and return JSON only, with no other text.
+
+Website: {url}
+Page title: {title}
+Meta description: {desc}
+Page text: {text}
+
+Return exactly this JSON shape:
+{{"brand": "brand name as customers say it", "aliases": ["other names, product names, or spellings"], "category": "one-line description of what the company sells", "keywords": ["20 keywords"]}}
+
+Keyword rules:
+- Exactly 20 bottom-of-funnel keywords a buyer types when ready to choose a vendor.
+- Every keyword starts with "best" and follows the formula "best [X] software", "best [X] services", or "best [X] tools".
+- MECE: each keyword covers a distinct use case, audience, industry, or segment. No overlap and no near duplicates. Together they cover every category this company competes in.
+- Use the buyer's language. Never include the brand name.
+- All lowercase."""
+
+QUERY_PROMPT = """Recommend me 10 {keyword}.
+
+Answer in markdown. Use a numbered list from 1 to 10. Start each item with the name in bold, followed by one sentence on why you recommend it."""
+
+
+def ask_claude(prompt, key, model, web=True, max_tokens=2500):
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=key)
+    kwargs = {"model": model, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]}
+    if web:
+        kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
+    msg = client.messages.create(**kwargs)
+    return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+
+
+def ask_openai(prompt, key, model, web=True):
+    from openai import OpenAI
+
+    client = OpenAI(api_key=key)
+    kwargs = {"model": model, "input": prompt}
+    if web:
+        kwargs["tools"] = [{"type": "web_search"}]
+    return client.responses.create(**kwargs).output_text
+
+
+def ask_gemini(prompt, key, model, web=True):
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=key)
+    config = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]) if web else None
+    return client.models.generate_content(model=model, contents=prompt, config=config).text or ""
+
+
+def ask_perplexity(prompt, key, model, web=True):
+    from openai import OpenAI
+
+    client = OpenAI(api_key=key, base_url="https://api.perplexity.ai")
+    resp = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}])
+    return resp.choices[0].message.content
+
+
+ASK = {"ChatGPT": ask_openai, "Claude": ask_claude, "Gemini": ask_gemini, "Perplexity": ask_perplexity}
+
+
+def run_one(engine, keyword, key, model, web):
+    """Runs in a worker thread, so it gets its key and model passed in."""
+    prompt = QUERY_PROMPT.format(keyword=keyword)
+    last_error = ""
+    for _ in range(2):
+        try:
+            text = ASK[engine](prompt, key, model, web) or ""
+            return {"engine": engine, "keyword": keyword, "response": re.sub(r"\[\d+\]", "", text), "error": ""}
+        except Exception as e:
+            last_error = str(e)[:300]
+            time.sleep(2)
+    return {"engine": engine, "keyword": keyword, "response": "", "error": last_error}
+
+
+def normalize_url(url):
+    url = url.strip()
+    return url if url.startswith("http") else "https://" + url
+
+
+def fetch_site(url):
+    try:
+        from bs4 import BeautifulSoup
+
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (compatible; PerceptricBot/1.0)"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "noscript", "svg"]):
+            tag.decompose()
+        title = soup.title.get_text(strip=True) if soup.title else ""
+        meta = soup.find("meta", attrs={"name": "description"})
+        desc = meta.get("content", "") if meta else ""
+        text = " ".join(soup.get_text(" ").split())[:8000]
+        return title, desc, text
+    except Exception:
+        return "", "", ""
+
+
+def parse_json(text):
+    text = re.sub(r"```(?:json)?", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    return json.loads(text[start: end + 1])
+
+
+def generate_profile(url, key, model):
+    title, desc, text = fetch_site(url)
+    raw = ask_claude(KEYWORD_PROMPT.format(url=url, title=title, desc=desc, text=text or "Not available"),
+                     key, model, web=not text, max_tokens=2000)
+    data = parse_json(raw)
+    data["keywords"] = [k.strip().lower() for k in data.get("keywords", []) if k.strip()][:20]
+    data["url"] = url
+    return data
+
+
+ITEM_RE = re.compile(r"^\s*(?:#+\s*)?(\d{1,2})[.)]\s+(.*)$")
+
+
+def parse_items(md):
+    items = []
+    for line in md.splitlines():
+        m = ITEM_RE.match(line)
+        if not m:
+            continue
+        rest = m.group(2)
+        bold = re.search(r"\*\*(.+?)\*\*", rest)
+        name = bold.group(1) if bold else re.split(r"\s[-–:]\s|:", rest)[0]
+        name = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", name)
+        name = re.sub(r"[\[\]\*`#]", "", name).strip(" :-–")
+        if name:
+            items.append((int(m.group(1)), name[:80]))
+    return items[:15]
+
+
+def brand_terms(brand, aliases, url):
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    root = host.split(".")[0]
+    terms = {brand.lower().strip(), host, root} | {a.lower().strip() for a in aliases}
+    return sorted(t for t in terms if len(t) >= 3)
+
+
+def evaluate(text, terms):
+    items = parse_items(text)
+    rank = None
+    for pos, name in items:
+        if any(t in name.lower() for t in terms):
+            rank = pos
+            break
+    low = text.lower()
+    mentioned = rank is not None or any(
+        re.search(r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])", low) for t in terms)
+    if rank:
+        score = max(10, 110 - 10 * rank)
+    elif mentioned:
+        score = 25
+    else:
+        score = 0
+    return items, mentioned, rank, score
+
+
+def norm_name(name):
+    return re.sub(r"[^a-z0-9 ]", "", name.lower()).strip()
+
+
+def build_ai_frames(results, terms):
+    rows = []
+    for r in results:
+        items, mentioned, rank, score = evaluate(r["response"], terms) if not r["error"] else ([], False, None, 0)
+        rows.append({
+            "Engine": r["engine"], "Keyword": r["keyword"], "Mentioned": "Yes" if mentioned else "No",
+            "Rank": rank, "Score": score, "Top 3": ", ".join(n for _, n in items[:3]),
+            "Items": items, "Response": r["response"], "Error": r["error"],
+        })
+    df = pd.DataFrame(rows)
+
+    comp = defaultdict(lambda: {"name": "", "count": 0, "engines": set(), "ranks": []})
+    for _, row in df.iterrows():
+        for pos, name in row["Items"]:
+            k = norm_name(name)
+            if not k or any(t in name.lower() for t in terms):
+                continue
+            c = comp[k]
+            c["name"] = c["name"] or name
+            c["count"] += 1
+            c["engines"].add(row["Engine"])
+            c["ranks"].append(pos)
+    comp_df = pd.DataFrame([
+        {"Brand": v["name"], "Mentions": v["count"], "Engines": len(v["engines"]),
+         "Avg rank": round(sum(v["ranks"]) / len(v["ranks"]), 1)}
+        for v in comp.values()
+    ])
+    if not comp_df.empty:
+        comp_df = comp_df.sort_values(["Mentions", "Avg rank"], ascending=[False, True]).head(25).reset_index(drop=True)
+    return df, comp_df
+
+
+def engine_summary(df):
+    out = []
+    for engine, g in df.groupby("Engine"):
+        ranked = g["Rank"].dropna()
+        out.append({
+            "Engine": engine,
+            "Visibility score": round(g["Score"].mean(), 1),
+            "Mention rate": round((g["Mentioned"] == "Yes").mean() * 100),
+            "Avg rank": round(ranked.mean(), 1) if len(ranked) else None,
+            "Prompts": len(g),
+        })
+    return pd.DataFrame(out).sort_values("Visibility score", ascending=False).reset_index(drop=True)
+
+
+def build_ai_markdown(profile, df, summary, comp_df):
+    lines = [
+        f"# AI Visibility Report: {profile['brand']}", "",
+        f"Website: {profile['url']}",
+        f"Date: {datetime.now():%Y-%m-%d}",
+        f"Visibility score: {df['Score'].mean():.1f} / 100",
+        f"Mention rate: {(df['Mentioned'] == 'Yes').mean() * 100:.0f}%", "",
+        "## Score by engine", "",
+        "| Engine | Visibility score | Mention rate | Avg rank |", "|---|---|---|---|",
+    ]
+    for _, s in summary.iterrows():
+        avg = s["Avg rank"] if pd.notna(s["Avg rank"]) else "-"
+        lines.append(f"| {s['Engine']} | {s['Visibility score']} | {s['Mention rate']}% | {avg} |")
+    if not comp_df.empty:
+        lines += ["", "## Top competitors", "", "| Brand | Mentions | Engines | Avg rank |", "|---|---|---|---|"]
+        for _, c in comp_df.iterrows():
+            lines.append(f"| {c['Brand'].replace('|', '/')} | {c['Mentions']} | {c['Engines']} | {c['Avg rank']} |")
+    for engine, g in df.groupby("Engine"):
+        lines += ["", f"## {engine}", "", "| Keyword | Mentioned | Rank | Score |", "|---|---|---|---|"]
+        for _, r in g.iterrows():
+            rank = int(r["Rank"]) if pd.notna(r["Rank"]) else "-"
+            lines.append(f"| {r['Keyword']} | {r['Mentioned']} | {rank} | {r['Score']} |")
+        for _, r in g.iterrows():
+            lines += ["", f"### {r['Keyword']}", "", r["Response"] or f"Error: {r['Error']}"]
+    return "\n".join(lines)
+
+
+AI_COLS = {
+    "Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+    "Visibility score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f"),
+    "Mention rate": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d%%"),
+    "Rank": st.column_config.NumberColumn(format="%d"),
+    "Avg rank": st.column_config.NumberColumn(format="%.1f"),
+    "Mentions": st.column_config.NumberColumn(format="localized"),
+}
+
+
+def ai_table(df, cfg=None, height=None):
+    cfg = cfg or {c: AI_COLS[c] for c in df.columns if c in AI_COLS}
+    kwargs = {"height": height} if height else {}
+    st.dataframe(df, width="stretch", hide_index=True, column_config=cfg, **kwargs)
+
+
+def render_ai_report(profile, df, comp_df):
+    summary = engine_summary(df)
+    ranked = df["Rank"].dropna()
+    score = df["Score"].mean()
+
+    cards([
+        ("AI visibility", f"{score:.0f}", "out of 100", "info"),
+        ("Mention rate", f"{(df['Mentioned'] == 'Yes').mean() * 100:.0f}%", None, None),
+        ("Avg rank when listed", f"{ranked.mean():.1f}" if len(ranked) else "–", None, None),
+        ("Prompts run", str(len(df)), None, None),
+    ])
+    errors = df[df["Error"] != ""]
+    if len(errors):
+        st.warning(f"{len(errors)} prompts failed. Open the engine tabs to see why.")
+
+    left, right = st.columns([2, 3], gap="medium")
+    with left:
+        with frame("Score by engine"):
+            bars(summary, "Engine", "Visibility score", height=240)
+    with right:
+        with frame("Engine breakdown"):
+            ai_table(summary)
+
+    engines = list(summary["Engine"])
+    sub = st.tabs(engines + ["Competitors", "Keywords"])
+    for i, engine in enumerate(engines):
+        with sub[i]:
+            g = df[df["Engine"] == engine]
+            with frame(f"{engine} answers"):
+                ai_table(g[["Keyword", "Mentioned", "Rank", "Score", "Top 3"]])
+            for _, r in g.iterrows():
+                tag = f"#{int(r['Rank'])}" if pd.notna(r["Rank"]) else ("mentioned" if r["Mentioned"] == "Yes" else "not mentioned")
+                with st.expander(f"{r['Keyword']}  ({tag})"):
+                    if r["Error"]:
+                        st.error(r["Error"])
+                    else:
+                        st.markdown(r["Response"])
+
+    with sub[-2]:
+        if comp_df.empty:
+            st.info("No competitors found.")
+        else:
+            with frame("Brands AI recommends most"):
+                bars(comp_df.head(10), "Brand", "Mentions", horizontal=True, height=320)
+            with frame("All competitors"):
+                ai_table(comp_df)
+
+    with sub[-1]:
+        pivot = df.pivot_table(index="Keyword", columns="Engine", values="Score", aggfunc="mean")
+        pivot["Average"] = pivot.mean(axis=1).round(1)
+        pivot = pivot.sort_values("Average", ascending=False).reset_index()
+        cfg = {c: st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f")
+               for c in pivot.columns if c != "Keyword"}
+        with frame("Score by keyword"):
+            ai_table(pivot, cfg=cfg, height=560)
+
+    slug = re.sub(r"[^a-z0-9]+", "-", profile["brand"].lower()).strip("-")
+    d1, d2, _ = st.columns([1, 1, 2])
+    d1.download_button("Download CSV", df.drop(columns=["Items"]).to_csv(index=False).encode(),
+                       file_name=f"{slug}-ai-visibility.csv", mime="text/csv", key="ai_dl_csv", width="stretch")
+    d2.download_button("Download Markdown report", build_ai_markdown(profile, df, summary, comp_df).encode(),
+                       file_name=f"{slug}-ai-visibility.md", mime="text/markdown", key="ai_dl_md", width="stretch")
+
+
 # ───────────────────────── look and feel (Perceptric neo-brutalist) ─────────────────────────
 st.markdown(
     """
@@ -542,6 +873,11 @@ input::placeholder, textarea::placeholder { color: #A6AEBB !important; }
 .pc-head { display: flex; align-items: center; gap: 12px; font-size: 18px; font-weight: 500;
   letter-spacing: -0.015em; line-height: 1.35; color: #0B0D12; margin: 0 0 4px; }
 .pc-head::before { content: ''; width: 8px; height: 8px; background: #0943B0; flex-shrink: 0; }
+
+/* Expanders (AI answers) */
+[data-testid="stExpander"] details { background: #FFFFFF; border: 1px solid #000 !important; border-radius: 4px !important; }
+[data-testid="stExpander"] summary p { font-size: 15px; font-weight: 500; color: #0B0D12; }
+[data-testid="stExpander"] summary:hover p { color: #0943B0; }
 
 /* Tables */
 [data-testid="stDataFrame"] { border: 1px solid #000; border-radius: 4px; overflow: hidden; background: #FFFFFF; }
@@ -628,8 +964,9 @@ LANG = LANGUAGES[lang_name]
 BASE = {"location_code": loc_code, "language_code": LANG}
 
 header()
-tab_domain, tab_rank, tab_pages, tab_kw, tab_ideas, tab_serp = st.tabs(
-    ["Domain overview", "Organic rankings", "Top pages", "Keyword overview", "Keyword ideas", "SERP check"]
+tab_domain, tab_rank, tab_pages, tab_kw, tab_ideas, tab_serp, tab_ai = st.tabs(
+    ["Domain overview", "Organic rankings", "Top pages", "Keyword overview", "Keyword ideas", "SERP check",
+     "AI visibility"]
 )
 
 
@@ -968,3 +1305,60 @@ with tab_serp:
                                             for _ in r], axis=1)
             table(sdf, styler=hl, height=520)
             download(sdf, "serp")
+
+# ───────────────────────── 7. AI visibility ─────────────────────────
+with tab_ai:
+    ai_keys = {e: secret(k) for e, (k, _, _) in AI_ENGINES.items()}
+    ai_models = {e: secret(m, d) for e, (_, m, d) in AI_ENGINES.items()}
+    available = [e for e in AI_ENGINES if ai_keys[e]]
+    if "Claude" not in available:
+        st.info("Add ANTHROPIC_API_KEY to your secrets to turn on AI visibility. Claude builds the keywords.")
+    else:
+        c1, c2 = st.columns([4, 1.4], vertical_alignment="bottom")
+        website = c1.text_input("Website", placeholder="momos.com", key="ai_site")
+        if c2.button("Generate keywords", type="primary", key="ai_gen", width="stretch"):
+            if not website.strip():
+                st.warning("Add a website.")
+            else:
+                with st.spinner("Claude is reading the website and building keywords..."):
+                    try:
+                        st.session_state.ai_profile = generate_profile(
+                            normalize_url(website), ai_keys["Claude"], ai_models["Claude"])
+                        st.session_state.pop("ai_results", None)
+                    except Exception as e:
+                        st.error(f"Keyword generation failed: {str(e)[:300]}")
+
+        profile = st.session_state.get("ai_profile")
+        if profile:
+            pid = profile["url"]
+            with frame("Review before you run"):
+                col1, col2 = st.columns(2)
+                profile["brand"] = col1.text_input("Brand name", profile.get("brand", ""), key=f"ai_brand_{pid}")
+                aliases = col2.text_input("Aliases (comma separated)", ", ".join(profile.get("aliases", [])),
+                                          key=f"ai_alias_{pid}")
+                profile["aliases"] = [a.strip() for a in aliases.split(",") if a.strip()]
+                if profile.get("category"):
+                    st.caption(profile["category"])
+                kw_text = st.text_area("Keywords (one per line)", "\n".join(profile["keywords"]), height=360,
+                                       key=f"ai_kws_{pid}")
+                keywords = [k.strip() for k in kw_text.splitlines() if k.strip()]
+                engines = st.multiselect("Engines", available, default=available, key="ai_engines")
+                st.caption(f"{len(keywords)} keywords × {len(engines)} engines = {len(keywords) * len(engines)} API calls")
+                run = st.button("Run visibility check", type="primary", key="ai_run",
+                                disabled=not (keywords and engines))
+
+            if run:
+                jobs = [(e, k) for e in engines for k in keywords]
+                results, bar = [], st.progress(0.0, text="Asking the AI engines...")
+                with ThreadPoolExecutor(max_workers=AI_WORKERS) as ex:
+                    futures = [ex.submit(run_one, e, k, ai_keys[e], ai_models[e], AI_WEB) for e, k in jobs]
+                    for i, f in enumerate(as_completed(futures), start=1):
+                        results.append(f.result())
+                        bar.progress(i / len(jobs), text=f"{i} of {len(jobs)} answers received")
+                bar.empty()
+                terms = brand_terms(profile["brand"], profile["aliases"], profile["url"])
+                st.session_state.ai_results = build_ai_frames(results, terms)
+
+        if st.session_state.get("ai_results") and profile:
+            df, comp_df = st.session_state.ai_results
+            render_ai_report(profile, df, comp_df)
